@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <!-- 문서 인코딩 및 메타 데이터 설정 -->
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="AI 기반 실시간 줄넘기 자세 분석 및 카운팅 스마트 코치">
+    <title>AI 줄넘기 코치 | Smart Jump Rope Assistant</title>
+    
+    <!-- 구글 폰트 (Outfit & Inter) 로드 -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;700;800&display=swap" rel="stylesheet">
+    
+    <!-- FontAwesome 아이콘 라이브러리 CDN -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- MediaPipe Pose & Camera & Drawing Utils CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+
+    <!-- 커스텀 스타일시트 -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <!-- 배경 오버레이 및 그래디언트 오라 효과 -->
+    <div class="background-decorations">
+        <div class="glow-sphere sphere-1"></div>
+        <div class="glow-sphere sphere-2"></div>
+    </div>
+
+    <div class="app-container">
+        <!-- 상단 네비게이션 헤더 -->
+        <header class="main-header">
+            <div class="logo-group">
+                <div class="logo-icon">
+                    <i class="fa-solid fa-person-skipping"></i>
+                </div>
+                <div class="logo-text">
+                    <h1>AI 줄넘기 코치</h1>
+                    <span class="badge">PRO v1.0</span>
+                </div>
+            </div>
+            <div class="status-indicator">
+                <span class="status-dot online"></span>
+                <span class="status-text" id="server-status">시스템 준비 완료</span>
+            </div>
+        </header>
+
+        <!-- 메인 콘텐츠 레이아웃 -->
+        <main class="dashboard-grid">
+            <!-- 좌측: 비디오 카메라 피드 및 실시간 코칭 오버레이 -->
+            <section class="video-section card">
+                <div class="card-header">
+                    <h2><i class="fa-solid fa-video"></i> 실시간 모니터링 피드</h2>
+                    <div class="metrics-tags">
+                        <span class="fps-tag" id="fps-counter">FPS: --</span>
+                        <span class="fps-tag conf-tag" id="conf-counter">CONF: --%</span>
+                    </div>
+                </div>
+                <div class="video-container" id="video-container">
+                    <!-- 비디오 프리뷰 뷰포트 -->
+                    <video id="webcam-video" autoplay playsinline muted class="webcam-feed"></video>
+                    
+                    <!-- MediaPipe Pose 관절 시각화 캔버스 -->
+                    <canvas id="output-canvas" class="webcam-canvas"></canvas>
+
+                    <!-- 카메라 미연결/대기 시 표시될 대기 화면 오버레이 -->
+                    <div class="video-placeholder" id="video-placeholder">
+                        <div class="placeholder-content">
+                            <i class="fa-solid fa-camera-rotate placeholder-icon"></i>
+                            <h3>카메라가 비활성화되어 있습니다</h3>
+                            <p>아래 '카메라 시작' 버튼을 눌러 AI 모니터링을 시작하세요.</p>
+                        </div>
+                    </div>
+
+                    <!-- 실시간 AI 상태 뱃지 (좌측 상단) -->
+                    <div class="overlay-badge" id="ai-status-badge">
+                        <i class="fa-solid fa-brain"></i> AI 감지 대기 중
+                    </div>
+
+                    <!-- 실시간 점프 4단계 상태 표시 뱃지 (우측 상단) -->
+                    <div class="jump-state-badge" id="jump-state-badge">
+                        <span class="state-label">JUMP STATE</span>
+                        <span class="state-value" id="jump-state-text">READY</span>
+                    </div>
+
+                    <!-- 사람 미인식 오버레이 경고 banner -->
+                    <div class="no-person-alert" id="no-person-alert" style="display: none;">
+                        <i class="fa-solid fa-triangle-exclamation"></i>
+                        <span>사람 미인식</span>
+                    </div>
+                </div>
+
+                <!-- 컨트롤 버튼 그룹 -->
+                <div class="control-panel">
+                    <button id="btn-toggle-cam" class="btn btn-primary">
+                        <i class="fa-solid fa-play"></i> 카메라 시작
+                    </button>
+                    <button id="btn-reset-counter" class="btn btn-secondary">
+                        <i class="fa-solid fa-rotate-left"></i> 카운트 리셋
+                    </button>
+                </div>
+            </section>
+
+            <!-- 우측: 대시보드 통계 및 코칭 피드백 패널 -->
+            <section class="stats-section">
+                <!-- 메인 줄넘기 횟수 카운터 카드 -->
+                <div class="card counter-card">
+                    <div class="counter-label">현재 줄넘기 횟수</div>
+                    <div class="counter-display">
+                        <span id="jump-count">0</span>
+                        <span class="unit">회</span>
+                    </div>
+                    <div class="counter-progress-bar">
+                        <div class="progress-fill" id="goal-progress" style="width: 0%;"></div>
+                    </div>
+                    <div class="goal-info">
+                        <span>목표: <strong id="target-count">100</strong>회</span>
+                        <span id="progress-percent">0% 달성</span>
+                    </div>
+                </div>
+
+                <!-- 실시간 운동 메트릭 정보 격자 -->
+                <div class="metrics-grid">
+                    <!-- 소모 칼로리 -->
+                    <div class="card metric-card">
+                        <div class="metric-icon kcal">
+                            <i class="fa-solid fa-fire"></i>
+                        </div>
+                        <div class="metric-info">
+                            <span class="metric-title">소모 칼로리</span>
+                            <span class="metric-value" id="val-calories">0.0 <small>kcal</small></span>
+                        </div>
+                    </div>
+
+                    <!-- 운동 시간 -->
+                    <div class="card metric-card">
+                        <div class="metric-icon time">
+                            <i class="fa-solid fa-stopwatch"></i>
+                        </div>
+                        <div class="metric-info">
+                            <span class="metric-title">운동 시간</span>
+                            <span class="metric-value" id="val-timer">00:00</span>
+                        </div>
+                    </div>
+
+                    <!-- 분당 속도 (RPM) -->
+                    <div class="card metric-card">
+                        <div class="metric-icon speed">
+                            <i class="fa-solid fa-bolt"></i>
+                        </div>
+                        <div class="metric-info">
+                            <span class="metric-title">분당 속도 (RPM)</span>
+                            <span class="metric-value" id="val-speed">0 <small>/min</small></span>
+                        </div>
+                    </div>
+
+                    <!-- 자세 점수 -->
+                    <div class="card metric-card">
+                        <div class="metric-icon score">
+                            <i class="fa-solid fa-star"></i>
+                        </div>
+                        <div class="metric-info">
+                            <span class="metric-title">자세 점수</span>
+                            <span class="metric-value" id="val-score">100 <small>점</small></span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- AI 코칭 실시간 피드백 박스 -->
+                <div class="card feedback-card">
+                    <div class="card-header">
+                        <h3><i class="fa-solid fa-comment-dots"></i> AI 실시간 코칭</h3>
+                    </div>
+                    <div class="feedback-content" id="feedback-box">
+                        <div class="feedback-message info">
+                            <i class="fa-solid fa-circle-info"></i>
+                            <span>카메라를 켜고 화면 중앙에 전신이 보이도록 서주세요.</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- 푸터 영역 -->
+        <footer class="main-footer">
+            <p>&copy; 2026 AI Jump Rope Coach. Developed with Flask & MediaPipe Pose.</p>
+        </footer>
+    </div>
+
+    <!-- 커스텀 자바스크립트 -->
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
