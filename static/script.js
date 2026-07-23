@@ -1,8 +1,11 @@
 /**
  * AI 줄넘기 코치 (AI Jump Rope Coach) - Client JavaScript
  * =========================================================
- * 원거리(2~3m) 인체 감지 최적화 (minDetectionConfidence: 0.35, minTrackingConfidence: 0.35)
- * 실시간 인식률(Confidence %) 표시 및 가동성 가중치 완화를 적용한 피지컬 AI 엔진
+ * 노트북 카메라 환경 최적화: 상체 중심(Torso Center) 점프 감지 엔진
+ * - 사용 랜드마크: 어깨(11, 12), 골반(23, 24)
+ * - 하체/발목 미인식 시에도 상체 움직임만으로 안정적 점프 측정
+ * - 상태 머신: READY -> JUMPING -> LANDING -> READY
+ * - 디버깅 오버레이: Torso Center Y, Baseline Y, State, Jump Count 실시간 표시
  */
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -22,6 +25,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const serverStatus = document.getElementById('server-status');
     const fpsCounter = document.getElementById('fps-counter');
     const confCounter = document.getElementById('conf-counter');
+    const torsoYCounter = document.getElementById('torso-y-counter');
+    const baselineYCounter = document.getElementById('baseline-y-counter');
 
     // 대시보드 통계 엘리먼트
     const jumpCountEl = document.getElementById('jump-count');
@@ -46,29 +51,26 @@ document.addEventListener('DOMContentLoaded', () => {
     let pose = null;
     let lastFrameTime = performance.now();
     let currentFps = 0;
-    let currentConf = 0; // 실시간 평균 인식률 (%)
+    let currentConf = 0; // 실시간 평균 상체 인식률 (%)
     let isProcessingFrame = false;
 
-    // 4단계 점프 상태 머신 (State Machine)
+    // 3단계 점프 상태 머신 (State Machine: READY -> JUMPING -> LANDING -> READY)
     const JUMP_STATES = {
         READY: 'READY',
         JUMPING: 'JUMPING',
-        PEAK: 'PEAK',
         LANDING: 'LANDING'
     };
 
     let currentState = JUMP_STATES.READY;
     let baselineY = null;
-    let minCenterY = 1.0;
+    let minTorsoY = 1.0;
     let lastStateRendered = '';
+    let debugInfo = { torsoCenterY: 0, baselineY: 0, deltaY: 0 };
 
-    // MediaPipe POSE CONNECTIONS 구조 정의
+    // 상체 중심 POSE CONNECTIONS 구조 정의 (어깨, 골반, 팔)
     const POSE_CONNECTIONS = (typeof window !== 'undefined' && window.POSE_CONNECTIONS) ? window.POSE_CONNECTIONS : [
-        [0, 1], [1, 2], [2, 3], [3, 7], [0, 4], [4, 5], [5, 6], [6, 8], [9, 10],
-        [11, 12], [11, 13], [13, 15], [15, 17], [15, 19], [15, 21], [17, 19],
-        [12, 14], [14, 16], [16, 18], [16, 20], [16, 22], [18, 20],
-        [11, 23], [12, 24], [23, 24], [23, 25], [24, 26], [25, 27], [26, 28],
-        [27, 29], [28, 30], [29, 31], [30, 32], [27, 31], [28, 32]
+        [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
+        [11, 23], [12, 24], [23, 24]
     ];
 
     // --------------------------------------------------------------------------
@@ -82,12 +84,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 serverStatus.textContent = '서버 연결됨 (정상)';
             }
         } catch (error) {
-            console.error('서버 연결 실패:', error);
+            console.log('서버 API 대기 중 또는 오프라인 모드:', error);
             if (serverStatus) {
-                serverStatus.textContent = '서버 연결 안 됨';
-                if (serverStatus.previousElementSibling) {
-                    serverStatus.previousElementSibling.classList.remove('online');
-                }
+                serverStatus.textContent = '웹캠 클라이언트 모드 가동 중';
             }
         }
     }
@@ -95,7 +94,7 @@ document.addEventListener('DOMContentLoaded', () => {
     checkServerHealth();
 
     // --------------------------------------------------------------------------
-    // 4. [요구사항 1 & 2] 원거리(2~3m) 인식을 위한 MediaPipe Pose 최적화 설정
+    // 4. [요구사항 5] 노트북 카메라 최적화 MediaPipe Pose 설정
     // --------------------------------------------------------------------------
     function initMediaPipePose() {
         if (typeof window.Pose === 'undefined') {
@@ -107,14 +106,14 @@ document.addEventListener('DOMContentLoaded', () => {
             locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
         });
 
-        // 원거리(2~3m) 소형 랜드마크도 놓치지 않도록 Detection/Tracking Confidence를 0.35로 조정
+        // 노트북 카메라 / 멀리 있는 사람 / 상체 전용 캡처를 위한 confidence 설정 (0.3)
         poseInstance.setOptions({
-            modelComplexity: 1,           // 중형 모델 (속도와 정밀도 최적 균형)
-            smoothLandmarks: true,        // 랜드마크 부드럽게 지수 보정
+            modelComplexity: 1,           // 중형 모델
+            smoothLandmarks: true,        // 지수 평활화 보정
             enableSegmentation: false,
             smoothSegmentation: false,
-            minDetectionConfidence: 0.35, // 0.5 -> 0.35 (원거리 사람 캡처율 대폭 향상)
-            minTrackingConfidence: 0.35   // 0.5 -> 0.35 (원거리 트래킹 유지력 대폭 향상)
+            minDetectionConfidence: 0.3,  // 상체만 보여도 인식 가능하도록 0.3 설정
+            minTrackingConfidence: 0.3    // 이동 중 추적 유지 0.3 설정
         });
 
         poseInstance.onResults(onResults);
@@ -122,12 +121,12 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // --------------------------------------------------------------------------
-    // 5. [요구사항 3, 4, 5] onResults(results) - 인식 조건 완화 및 인식률(Confidence %) 표시
+    // 5. onResults(results) - 프레임 처리 및 디버깅 오버레이 렌더링
     // --------------------------------------------------------------------------
     function onResults(results) {
         if (!isCameraActive) return;
 
-        // 실시간 FPS 계산
+        // FPS 계산
         const now = performance.now();
         const delta = (now - lastFrameTime) / 1000;
         lastFrameTime = now;
@@ -139,7 +138,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }
 
-        // 캔버스 크기 조정
+        // 캔버스 크기 동기화
         if (outputCanvas && webcamVideo.videoWidth > 0) {
             if (outputCanvas.width !== webcamVideo.videoWidth || outputCanvas.height !== webcamVideo.videoHeight) {
                 outputCanvas.width = webcamVideo.videoWidth;
@@ -150,49 +149,43 @@ document.addEventListener('DOMContentLoaded', () => {
         canvasCtx.save();
         canvasCtx.clearRect(0, 0, outputCanvas.width, outputCanvas.height);
 
-        // 랜드마크 검출 여부 및 완화된 판단 기준 (가시성 0.15 이상인 주요 랜드마크 존재 여부)
         if (results && results.poseLandmarks && results.poseLandmarks.length > 0) {
             const landmarks = results.poseLandmarks;
 
-            // [요구사항 4] 평균 인식률(Confidence %) 계산 (주요 상하체 랜드마크 기준)
-            const checkIndices = [11, 12, 23, 24, 25, 26, 27, 28]; // 어깨, 엉덩이, 무릎, 발목
+            // [요구사항 1] 상체 주요 랜드마크만 사용 (어깨 11, 12 / 골반 23, 24)
+            const torsoIndices = [11, 12, 23, 24];
             let validCount = 0;
             let totalVis = 0;
 
-            for (const idx of checkIndices) {
+            for (const idx of torsoIndices) {
                 if (landmarks[idx]) {
                     const vis = landmarks[idx].visibility || 0;
                     totalVis += vis;
-                    if (vis > 0.15) validCount++; // 원거리 인식을 위한 완화된 threshold (0.15)
+                    if (vis > 0.15) validCount++;
                 }
             }
 
-            const avgVisRatio = checkIndices.length > 0 ? (totalVis / checkIndices.length) : 0;
+            const avgVisRatio = torsoIndices.length > 0 ? (totalVis / torsoIndices.length) : 0;
             currentConf = Math.min(100, Math.round(avgVisRatio * 100));
 
-            // [요구사항 4] 화면 상단 디버깅 태그에 Confidence % 실시간 표시
             if (confCounter) {
-                confCounter.textContent = `CONF: ${currentConf}% (Det: 0.35/Trk: 0.35)`;
-                if (currentConf < 40) {
-                    confCounter.style.color = '#f59e0b'; // 경고 주황
-                } else {
-                    confCounter.style.color = '#10b981'; // 초록
-                }
+                confCounter.textContent = `CONF: ${currentConf}%`;
+                confCounter.style.color = currentConf < 30 ? '#f59e0b' : '#10b981';
             }
 
-            // [요구사항 3] 사람 미인식 완화 조건: 주요 관절 중 3개 이상 감지되면 인식 성공으로 처리 (2~3m 완벽 지원)
-            const isPersonDetected = validCount >= 3 || avgVisRatio >= 0.2;
+            // 상체 랜드마크 중 2개 이상 인식되면 감지 성공
+            const isPersonDetected = validCount >= 2 || avgVisRatio >= 0.15;
 
             if (isPersonDetected) {
-                // 초록색(#00FF00) 관절과 연결선 드로잉
+                // 1. 관절 연결선 그려주기 (상체 위주)
                 if (typeof window.drawConnectors === 'function') {
                     window.drawConnectors(canvasCtx, landmarks, POSE_CONNECTIONS, {
-                        color: '#00FF00',
-                        lineWidth: 4
+                        color: '#00FF88',
+                        lineWidth: 3
                     });
                 } else {
-                    canvasCtx.lineWidth = 4;
-                    canvasCtx.strokeStyle = '#00FF00';
+                    canvasCtx.lineWidth = 3;
+                    canvasCtx.strokeStyle = '#00FF88';
                     for (const conn of POSE_CONNECTIONS) {
                         const p1 = landmarks[conn[0]];
                         const p2 = landmarks[conn[1]];
@@ -205,39 +198,36 @@ document.addEventListener('DOMContentLoaded', () => {
                     }
                 }
 
-                if (typeof window.drawLandmarks === 'function') {
-                    window.drawLandmarks(canvasCtx, landmarks, {
-                        color: '#00FF00',
-                        fillColor: '#00FF00',
-                        lineWidth: 2,
-                        radius: 5
-                    });
-                } else {
-                    for (let i = 0; i < landmarks.length; i++) {
-                        const lm = landmarks[i];
-                        if (lm && (lm.visibility || 0) > 0.15) {
-                            const x = lm.x * outputCanvas.width;
-                            const y = lm.y * outputCanvas.height;
-                            canvasCtx.beginPath();
-                            canvasCtx.arc(x, y, 5, 0, 2 * Math.PI);
-                            canvasCtx.fillStyle = '#00FF00';
-                            canvasCtx.fill();
-                            canvasCtx.lineWidth = 2;
-                            canvasCtx.strokeStyle = '#FFFFFF';
-                            canvasCtx.stroke();
-                        }
+                // 2. 어깨(11,12) 및 골반(23,24) 관절 노드 포인트 표시
+                for (const idx of torsoIndices) {
+                    const lm = landmarks[idx];
+                    if (lm && (lm.visibility || 0) > 0.15) {
+                        const x = lm.x * outputCanvas.width;
+                        const y = lm.y * outputCanvas.height;
+                        canvasCtx.beginPath();
+                        canvasCtx.arc(x, y, 6, 0, 2 * Math.PI);
+                        canvasCtx.fillStyle = '#00E5FF';
+                        canvasCtx.fill();
+                        canvasCtx.lineWidth = 2;
+                        canvasCtx.strokeStyle = '#FFFFFF';
+                        canvasCtx.stroke();
                     }
                 }
 
-                // "사람 인식" 상태 표시
+                // "사람 인식" 뱃지 활성화
                 if (noPersonAlert) noPersonAlert.style.display = 'none';
                 if (aiStatusBadge) {
                     aiStatusBadge.className = 'overlay-badge active';
-                    aiStatusBadge.innerHTML = `<i class="fa-solid fa-user-check"></i> 사람 인식 (${currentConf}%)`;
+                    aiStatusBadge.innerHTML = `<i class="fa-solid fa-user-check"></i> 상체 감지 완료 (${currentConf}%)`;
                 }
 
-                // 4단계 점프 상태 머신 실행
-                processJumpStateMachine(landmarks);
+                // [요구사항 2, 3, 4] 몸통 중심 계산 및 상태 머신 실행
+                const info = processJumpStateMachine(landmarks);
+                if (info) {
+                    debugInfo = info;
+                    // [요구사항 6] 디버깅 화면 오버레이 그려주기
+                    renderDebugOverlay(canvasCtx, outputCanvas.width, outputCanvas.height, debugInfo);
+                }
             } else {
                 handleNoPersonDetected();
             }
@@ -250,99 +240,199 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     /**
-     * 사람이 감지되지 않았을 때의 상태 표시
+     * 사람이 감지되지 않았을 때의 처리
      */
     function handleNoPersonDetected() {
         if (confCounter) {
             confCounter.textContent = 'CONF: 0%';
             confCounter.style.color = '#ef4444';
         }
+        if (torsoYCounter) torsoYCounter.textContent = 'Torso Y: --';
+        if (baselineYCounter) baselineYCounter.textContent = 'Base Y: --';
 
         if (noPersonAlert) {
             noPersonAlert.style.display = 'flex';
-            noPersonAlert.innerHTML = '<i class="fa-solid fa-triangle-exclamation"></i> <span>사람 미인식</span>';
+            noPersonAlert.innerHTML = '<i class="fa-solid fa-triangle-exclamation"></i> <span>상체 미인식 (카메라 중앙에 위치해주세요)</span>';
         }
 
         if (aiStatusBadge) {
             aiStatusBadge.className = 'overlay-badge warning';
-            aiStatusBadge.innerHTML = '<i class="fa-solid fa-user-slash"></i> 사람 미인식';
+            aiStatusBadge.innerHTML = '<i class="fa-solid fa-user-slash"></i> 상체 미인식';
         }
 
         updateJumpStateUI(JUMP_STATES.READY);
-        updateFeedback('warning', '사람 미인식: 화면 2~3m 거리 중앙에 전신이 보이도록 서주세요.');
+        updateFeedback('warning', '상체가 인식되지 않았습니다. 노트북 화면 중앙에 어깨와 골반이 보이도록 서주세요.');
     }
 
     // --------------------------------------------------------------------------
-    // 6. 원거리(2~3m) 자동 스케일링 점프 4단계 상태 머신 (READY -> JUMPING -> PEAK -> LANDING)
+    // 6. [요구사항 1, 2, 3, 4] 몸통 중심 점프 상태 머신 (READY -> JUMPING -> LANDING -> READY)
     // --------------------------------------------------------------------------
     function processJumpStateMachine(landmarks) {
+        const leftShoulder = landmarks[11];
+        const rightShoulder = landmarks[12];
         const leftHip = landmarks[23];
         const rightHip = landmarks[24];
-        const leftKnee = landmarks[25];
-        const rightKnee = landmarks[26];
-        const leftAnkle = landmarks[27];
-        const rightAnkle = landmarks[28];
 
-        if (!leftHip || !rightHip || !leftKnee || !rightKnee || !leftAnkle || !rightAnkle) return;
+        // [요구사항 2] 어깨 중심 및 골반 중심 좌표 계산
+        let shoulderCenterY = null;
+        let hipCenterY = null;
 
-        // 중심 Y좌표 계산
-        const hipY = (leftHip.y + rightHip.y) / 2;
-        const kneeY = (leftKnee.y + rightKnee.y) / 2;
-        const ankleY = (leftAnkle.y + rightAnkle.y) / 2;
-        const currentCenterY = (hipY * 0.4) + (kneeY * 0.3) + (ankleY * 0.3);
-
-        // 2~3m 원거리 인체 크기 자동 스케일링: 엉덩이-발목 높이를 기준으로 점프 임계값(jumpThreshold) 자동 보정
-        const bodyHeight = Math.max(0.1, Math.abs(ankleY - hipY));
-        const jumpThreshold = Math.max(0.018, bodyHeight * 0.12); // 원거리 소형 인체도 쉽게 인지 가능하도록 동적 설정
-
-        if (baselineY === null) {
-            baselineY = currentCenterY;
+        if (leftShoulder && rightShoulder) {
+            shoulderCenterY = (leftShoulder.y + rightShoulder.y) / 2;
+        }
+        if (leftHip && rightHip) {
+            hipCenterY = (leftHip.y + rightHip.y) / 2;
         }
 
+        // [요구사항 2] 몸통 중심(Torso Center Y) 좌표 계산
+        let torsoCenterY = null;
+        if (shoulderCenterY !== null && hipCenterY !== null) {
+            torsoCenterY = (shoulderCenterY + hipCenterY) / 2;
+        } else if (shoulderCenterY !== null) {
+            torsoCenterY = shoulderCenterY;
+        } else if (hipCenterY !== null) {
+            torsoCenterY = hipCenterY;
+        }
+
+        if (torsoCenterY === null) return null;
+
+        // [요구사항 3] 점프 판단 임계값 (baseline - torsoCenterY > 0.03)
+        const jumpThreshold = 0.03;
+
+        // Baseline (기준 위치) 최초 설정 및 자동 보정
+        if (baselineY === null) {
+            baselineY = torsoCenterY;
+        }
+
+        // READY 상태에서 사용자가 평지에 서있을 때 baseline을 정밀 유지
         if (currentState === JUMP_STATES.READY) {
-            if (Math.abs(currentCenterY - baselineY) < (jumpThreshold * 1.5)) {
-                baselineY = baselineY * 0.95 + currentCenterY * 0.05;
+            if (Math.abs(torsoCenterY - baselineY) < (jumpThreshold * 0.8)) {
+                baselineY = baselineY * 0.95 + torsoCenterY * 0.05; // 지수 이동 평균
             }
         }
 
-        const deltaY = baselineY - currentCenterY;
+        // Y축 특성상 위로 상승하면 torsoCenterY 값이 감소하므로 (baselineY - torsoCenterY > 0)
+        const deltaY = baselineY - torsoCenterY;
 
+        // [요구사항 4] 상태 머신 전이 (READY -> JUMPING -> LANDING -> READY)
         switch (currentState) {
             case JUMP_STATES.READY:
+                // [요구사항 3] torsoCenterY가 baseline보다 0.03 이상 위로 이동하면 JUMPING 시작
                 if (deltaY > jumpThreshold) {
                     currentState = JUMP_STATES.JUMPING;
-                    minCenterY = currentCenterY;
-                    updateFeedback('info', '상승 도약 중 (JUMPING)');
+                    minTorsoY = torsoCenterY;
+                    updateFeedback('info', '🚀 점프 상승 중! (JUMPING)');
                 }
                 break;
 
             case JUMP_STATES.JUMPING:
-                if (currentCenterY < minCenterY) {
-                    minCenterY = currentCenterY;
+                if (torsoCenterY < minTorsoY) {
+                    minTorsoY = torsoCenterY; // 최고점 위치 기록
                 }
-                if (currentCenterY - minCenterY > (jumpThreshold * 0.3)) {
-                    currentState = JUMP_STATES.PEAK;
-                    updateFeedback('info', '점프 최고점 도달! (PEAK)');
+                // 최고점을 지나 하강하기 시작하면 LANDING으로 전환
+                if ((torsoCenterY - minTorsoY) > (jumpThreshold * 0.25) || deltaY <= (jumpThreshold * 0.5)) {
+                    currentState = JUMP_STATES.LANDING;
+                    updateFeedback('info', '🛬 착지 진행 중... (LANDING)');
                 }
-                break;
-
-            case JUMP_STATES.PEAK:
-                currentState = JUMP_STATES.LANDING;
-                updateFeedback('info', '착지 하강 중 (LANDING)');
                 break;
 
             case JUMP_STATES.LANDING:
-                if (currentCenterY >= (baselineY - jumpThreshold * 0.35)) {
+                // [요구사항 3] 원래 높이 부근으로 내려오면 (torsoCenterY >= baseline - threshold) 착지 완료
+                if (torsoCenterY >= (baselineY - jumpThreshold * 0.35)) {
                     currentJumpCount++;
                     updateUI();
 
                     currentState = JUMP_STATES.READY;
-                    updateFeedback('info', `착지 완료! (총 ${currentJumpCount}회 점프)`);
+                    updateFeedback('info', `🎉 점프 착지 완료! (총 ${currentJumpCount}회 점프)`);
                 }
                 break;
         }
 
         updateJumpStateUI(currentState);
+
+        // 태그에 Y 값 실시간 갱신
+        if (torsoYCounter) torsoYCounter.textContent = `Torso Y: ${torsoCenterY.toFixed(3)}`;
+        if (baselineYCounter) baselineYCounter.textContent = `Base Y: ${baselineY.toFixed(3)}`;
+
+        return {
+            torsoCenterY: torsoCenterY,
+            baselineY: baselineY,
+            deltaY: deltaY,
+            jumpThreshold: jumpThreshold,
+            shoulderCenterY: shoulderCenterY,
+            hipCenterY: hipCenterY
+        };
+    }
+
+    // --------------------------------------------------------------------------
+    // 7. [요구사항 6] 디버깅 화면 오버레이 (Torso Center Y, Baseline Y, State, Count)
+    // --------------------------------------------------------------------------
+    function renderDebugOverlay(ctx, width, height, info) {
+        if (!info || !ctx) return;
+
+        const { torsoCenterY, baselineY } = info;
+
+        // A. Baseline Y 기준선 (가로 점선)
+        const baseYPixel = baselineY * height;
+        ctx.save();
+        ctx.beginPath();
+        ctx.setLineDash([8, 4]);
+        ctx.moveTo(0, baseYPixel);
+        ctx.lineTo(width, baseYPixel);
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = '#FFD700'; // 골드 노란색
+        ctx.stroke();
+
+        // Baseline Y 텍스트 표기
+        ctx.font = 'bold 12px Inter, sans-serif';
+        ctx.fillStyle = '#FFD700';
+        ctx.fillText(`--- Baseline Y (${baselineY.toFixed(4)}) ---`, width - 210, baseYPixel - 6);
+
+        // B. Torso Center Y 좌표 포인트 (Cyan 빛나는 점)
+        const torsoYPixel = torsoCenterY * height;
+        const centerXPixel = width / 2;
+
+        ctx.beginPath();
+        ctx.arc(centerXPixel, torsoYPixel, 9, 0, 2 * Math.PI);
+        ctx.fillStyle = '#00FFFF';
+        ctx.fill();
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = '#FFFFFF';
+        ctx.stroke();
+
+        ctx.font = 'bold 13px Inter, sans-serif';
+        ctx.fillStyle = '#00FFFF';
+        ctx.fillText(`● Torso Center Y (${torsoCenterY.toFixed(4)})`, centerXPixel + 15, torsoYPixel + 4);
+        ctx.restore();
+
+        // C. 좌측 상단 통합 디버그 패널 (요구사항 6: Torso Center Y, Baseline, State, Jump Count)
+        ctx.save();
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.78)'; // 글래스모피즘 어두운 배경
+        ctx.fillRect(15, 55, 230, 110);
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(15, 55, 230, 110);
+
+        ctx.font = 'bold 13px Outfit, sans-serif';
+        ctx.fillStyle = '#38BDF8';
+        ctx.fillText('📊 AI DEBUG PANEL', 25, 75);
+
+        ctx.font = '500 12px Inter, sans-serif';
+        ctx.fillStyle = '#E2E8F0';
+        ctx.fillText(`Torso Center Y:  ${torsoCenterY.toFixed(4)}`, 25, 95);
+        ctx.fillText(`Baseline Y:      ${baselineY.toFixed(4)}`, 25, 113);
+
+        // 상태별 컬러 매핑
+        let stateBg = '#10B981'; // READY - Green
+        if (currentState === JUMP_STATES.JUMPING) stateBg = '#F59E0B'; // JUMPING - Orange
+        if (currentState === JUMP_STATES.LANDING) stateBg = '#3B82F6'; // LANDING - Blue
+
+        ctx.fillStyle = stateBg;
+        ctx.fillText(`State:  ${currentState}`, 25, 133);
+
+        ctx.fillStyle = '#FACC15';
+        ctx.fillText(`Count: ${currentJumpCount} 회`, 140, 133);
+        ctx.restore();
     }
 
     function updateJumpStateUI(state) {
@@ -354,7 +444,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // --------------------------------------------------------------------------
-    // 7. 웹캠 제어 및 프레임 전송 루프
+    // 8. 웹캠 제어 및 처리 루프
     // --------------------------------------------------------------------------
     btnToggleCam.addEventListener('click', async () => {
         if (!isCameraActive) {
@@ -392,12 +482,12 @@ document.addEventListener('DOMContentLoaded', () => {
             btnToggleCam.classList.add('btn-secondary');
 
             aiStatusBadge.className = 'overlay-badge';
-            aiStatusBadge.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> AI 감지 동작 중...';
+            aiStatusBadge.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 상체 AI 추적 중...';
             fpsCounter.textContent = 'FPS: 계산 중';
             if (confCounter) confCounter.textContent = 'CONF: 측정 중';
 
             startTimer();
-            updateFeedback('info', '카메라가 연결되었습니다. 2~3m 거리에서 서서 점프 모니터링을 시작하세요!');
+            updateFeedback('info', '노트북 카메라가 연결되었습니다. 화면 중앙에 서면 상체 기반 줄넘기 측정이 시작됩니다!');
 
             startPoseProcessingLoop();
 
@@ -436,20 +526,17 @@ document.addEventListener('DOMContentLoaded', () => {
             detailGuide = '브라우저 주소창 좌측의 [자물쇠] 아이콘을 눌러 카메라 권한을 [허용]으로 변경 후 새로고침해 주세요.';
         } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
             errorMessage = '연결된 웹캠 카메라 장치를 찾을 수 없습니다.';
-            detailGuide = '카메라 장치가 PC/모바일에 올바르게 연결되어 있는지 연결 상태를 확인해 주세요.';
+            detailGuide = '카메라 장치가 PC/모바일에 올바르게 연결되어 있는지 확인해 주세요.';
         } else if (error.name === 'NotReadableError' || error.name === 'TrackStartError') {
             errorMessage = '카메라 장치를 시작할 수 없습니다 (이미 사용 중).';
-            detailGuide = '다른 프로그램(Zoom, Teams, Skype 등)에서 카메라를 사용 중인지 확인하고 종료해 주세요.';
-        } else if (error.name === 'SecurityError') {
-            errorMessage = '보안 웹 환경(HTTPS 또는 localhost)에서만 카메라 접근이 허용됩니다.';
-            detailGuide = '안전한 HTTPS 연결 주소로 접속해 주시기 바랍니다.';
+            detailGuide = '다른 프로그램(Zoom, Teams 등)에서 카메라를 사용 중인지 확인 후 종료해 주세요.';
         } else {
             errorMessage = `카메라 연결 오류 (${error.name || 'Unknown'})`;
-            detailGuide = error.message || '웹캠 설정을 다시 점검해 주세요.';
+            detailGuide = error.message || '웹캠 설정을 점검해 주세요.';
         }
 
         updateFeedback('danger', `${errorMessage} ${detailGuide}`);
-        alert(`[카메라 연결 실패]\n${errorMessage}\n\n원인 및 조치 방법:\n${detailGuide}`);
+        alert(`[카메라 연결 실패]\n${errorMessage}\n\n조치 방법:\n${detailGuide}`);
         stopCamera();
     }
 
@@ -474,6 +561,8 @@ document.addEventListener('DOMContentLoaded', () => {
         aiStatusBadge.innerHTML = '<i class="fa-solid fa-brain"></i> AI 감지 대기 중';
         fpsCounter.textContent = 'FPS: --';
         if (confCounter) confCounter.textContent = 'CONF: --%';
+        if (torsoYCounter) torsoYCounter.textContent = 'Torso Y: --';
+        if (baselineYCounter) baselineYCounter.textContent = 'Base Y: --';
 
         currentState = JUMP_STATES.READY;
         baselineY = null;
@@ -484,7 +573,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // --------------------------------------------------------------------------
-    // 8. 카운트 리셋 핸들러
+    // 9. 카운트 리셋
     // --------------------------------------------------------------------------
     btnResetCounter.addEventListener('click', () => {
         currentJumpCount = 0;
@@ -493,11 +582,11 @@ document.addEventListener('DOMContentLoaded', () => {
         baselineY = null;
         updateUI();
         updateJumpStateUI(JUMP_STATES.READY);
-        updateFeedback('info', '줄넘기 카운트 및 운동 타이머가 리셋되었습니다.');
+        updateFeedback('info', '줄넘기 카운트 및 기준(Baseline) 위치가 리셋되었습니다.');
     });
 
     // --------------------------------------------------------------------------
-    // 9. 타이머 및 UI 업데이트 유틸리티
+    // 10. 타이머 및 UI 유틸리티
     // --------------------------------------------------------------------------
     function startTimer() {
         if (timerInterval) clearInterval(timerInterval);
